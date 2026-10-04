@@ -1,6 +1,10 @@
 package com.github.xingjianluo.auditlogintegrityjava;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveKeyProvider;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveService;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveSigner;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveVerifier;
 import com.github.xingjianluo.auditlogintegrityjava.config.AuditProperties;
 import com.github.xingjianluo.auditlogintegrityjava.crypto.ChainHasher;
 import com.github.xingjianluo.auditlogintegrityjava.export.ExportService;
@@ -29,11 +33,13 @@ public final class AuditTestSupport {
         private final AuditService auditService;
         private final LocalReceiverClient receiver;
         private final ExportService exportService;
+        private final ArchiveService archiveService;
         private AuditEventBuilder builder;
 
         Harness(Path dir, ObjectMapper mapper, ChainHasher hasher, FileAuditStore store,
                 MaskingService maskingService, AuditService auditService,
-                LocalReceiverClient receiver, ExportService exportService) {
+                LocalReceiverClient receiver, ExportService exportService,
+                ArchiveService archiveService) {
             this.dir = dir;
             this.mapper = mapper;
             this.hasher = hasher;
@@ -42,6 +48,7 @@ public final class AuditTestSupport {
             this.auditService = auditService;
             this.receiver = receiver;
             this.exportService = exportService;
+            this.archiveService = archiveService;
         }
 
         public Path dir() { return dir; }
@@ -52,6 +59,7 @@ public final class AuditTestSupport {
         public AuditService auditService() { return auditService; }
         public LocalReceiverClient receiver() { return receiver; }
         public ExportService exportService() { return exportService; }
+        public ArchiveService archiveService() { return archiveService; }
 
         public AuditEventBuilder events() {
             if (builder == null) {
@@ -95,9 +103,21 @@ public final class AuditTestSupport {
     }
 
     public static Harness harness(Path dir, List<String> sensitiveFields) {
+        return harness(dir, sensitiveFields, "local", "local-test-key", Map.of());
+    }
+
+    /**
+     * 带归档环境身份与密钥的装配：envId 标识环境，archiveKey 为本环境签名密钥，
+     * trustedKeys 为可核验/导入的其他环境密钥。
+     */
+    public static Harness harness(Path dir, List<String> sensitiveFields, String envId,
+                                  String archiveKey, Map<String, String> trustedKeys) {
         AuditProperties props = new AuditProperties();
         props.setDataDir(dir.toString());
         props.setSensitiveFields(new ArrayList<>(sensitiveFields));
+        props.setEnvironmentId(envId);
+        props.setArchiveKey(archiveKey);
+        props.setTrustedArchiveKeys(trustedKeys);
         ObjectMapper mapper = new ObjectMapper();
         ChainHasher hasher = new ChainHasher();
         FileAuditStore store = new FileAuditStore(props, mapper);
@@ -105,7 +125,11 @@ public final class AuditTestSupport {
         AuditService audit = new AuditService(store, hasher, masking);
         LocalReceiverClient receiver = new LocalReceiverClient();
         ExportService exporter = new ExportService(audit, receiver);
-        return new Harness(dir, mapper, hasher, store, masking, audit, receiver, exporter);
+        ArchiveKeyProvider keys = new ArchiveKeyProvider(props);
+        ArchiveSigner signer = new ArchiveSigner();
+        ArchiveVerifier verifier = new ArchiveVerifier(hasher, signer, keys, mapper);
+        ArchiveService archive = new ArchiveService(audit, keys, signer, verifier, props, mapper);
+        return new Harness(dir, mapper, hasher, store, masking, audit, receiver, exporter, archive);
     }
 
     public static Map<String, String> payload(String... kv) {

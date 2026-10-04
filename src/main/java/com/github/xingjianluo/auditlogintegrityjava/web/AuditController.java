@@ -1,5 +1,9 @@
 package com.github.xingjianluo.auditlogintegrityjava.web;
 
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveExportResult;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveImportResult;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveService;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveVerification;
 import com.github.xingjianluo.auditlogintegrityjava.chain.AuditEvent;
 import com.github.xingjianluo.auditlogintegrityjava.chain.VerificationReport;
 import com.github.xingjianluo.auditlogintegrityjava.export.ExportResult;
@@ -31,13 +35,16 @@ public class AuditController {
     private final ExportService exportService;
     private final MaskingService maskingService;
     private final LocalReceiverClient receiver;
+    private final ArchiveService archiveService;
 
     public AuditController(AuditService auditService, ExportService exportService,
-                           MaskingService maskingService, LocalReceiverClient receiver) {
+                           MaskingService maskingService, LocalReceiverClient receiver,
+                           ArchiveService archiveService) {
         this.auditService = auditService;
         this.exportService = exportService;
         this.maskingService = maskingService;
         this.receiver = receiver;
+        this.archiveService = archiveService;
     }
 
     @PostMapping("/events")
@@ -70,6 +77,37 @@ public class AuditController {
     @PostMapping("/export/order")
     public ExportResult exportOrdered(@RequestBody List<String> orderedEventIds) {
         return exportService.exportInOrder(orderedEventIds);
+    }
+
+    /** 导出 [fromSeq, toSeq] 区间为自包含归档包（上界裁剪到当前链尾） */
+    @PostMapping("/archive/export")
+    public ArchiveExportResult exportArchive(@RequestParam long fromSeq, @RequestParam long toSeq) {
+        return archiveService.exportRange(fromSeq, toSeq);
+    }
+
+    /** 离线核验归档包；expectedEnv 可选，用于断言来源环境 */
+    @PostMapping("/archive/verify")
+    public ArchiveVerification verifyArchive(@RequestParam String path,
+                                             @RequestParam(required = false) String expectedEnv) {
+        return archiveService.verify(java.nio.file.Path.of(path), expectedEnv);
+    }
+
+    /** 幂等导入归档包，与本地链并存 */
+    @PostMapping("/archive/import")
+    public ArchiveImportResult importArchive(@RequestParam String path) {
+        return archiveService.importArchive(java.nio.file.Path.of(path));
+    }
+
+    /** 已导入的归档段列表 */
+    @GetMapping("/archive/imports")
+    public List<String> listImports() {
+        return archiveService.listImports();
+    }
+
+    /** 核验某个已导入的归档段 */
+    @PostMapping("/archive/imports/verify")
+    public ArchiveVerification verifyImported(@RequestParam String storedAs) {
+        return archiveService.verifyImported(storedAs);
     }
 
     /** 测试用：模拟接收端故障开关 */
