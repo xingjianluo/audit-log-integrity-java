@@ -1,6 +1,11 @@
 package com.github.xingjianluo.auditlogintegrityjava;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveExportService;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveImportService;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveKeyService;
+import com.github.xingjianluo.auditlogintegrityjava.archive.ArchiveVerifier;
+import com.github.xingjianluo.auditlogintegrityjava.chain.AuditEvent;
 import com.github.xingjianluo.auditlogintegrityjava.config.AuditProperties;
 import com.github.xingjianluo.auditlogintegrityjava.crypto.ChainHasher;
 import com.github.xingjianluo.auditlogintegrityjava.export.ExportService;
@@ -8,6 +13,7 @@ import com.github.xingjianluo.auditlogintegrityjava.export.LocalReceiverClient;
 import com.github.xingjianluo.auditlogintegrityjava.policy.MaskingService;
 import com.github.xingjianluo.auditlogintegrityjava.service.AuditService;
 import com.github.xingjianluo.auditlogintegrityjava.service.EventInput;
+import com.github.xingjianluo.auditlogintegrityjava.storage.Anchor;
 import com.github.xingjianluo.auditlogintegrityjava.storage.FileAuditStore;
 
 import java.nio.file.Path;
@@ -29,11 +35,17 @@ public final class AuditTestSupport {
         private final AuditService auditService;
         private final LocalReceiverClient receiver;
         private final ExportService exportService;
+        private final ArchiveKeyService archiveKeyService;
+        private final ArchiveVerifier archiveVerifier;
+        private final ArchiveExportService archiveExportService;
+        private final ArchiveImportService archiveImportService;
         private AuditEventBuilder builder;
 
         Harness(Path dir, ObjectMapper mapper, ChainHasher hasher, FileAuditStore store,
                 MaskingService maskingService, AuditService auditService,
-                LocalReceiverClient receiver, ExportService exportService) {
+                LocalReceiverClient receiver, ExportService exportService,
+                ArchiveKeyService archiveKeyService, ArchiveVerifier archiveVerifier,
+                ArchiveExportService archiveExportService, ArchiveImportService archiveImportService) {
             this.dir = dir;
             this.mapper = mapper;
             this.hasher = hasher;
@@ -42,6 +54,10 @@ public final class AuditTestSupport {
             this.auditService = auditService;
             this.receiver = receiver;
             this.exportService = exportService;
+            this.archiveKeyService = archiveKeyService;
+            this.archiveVerifier = archiveVerifier;
+            this.archiveExportService = archiveExportService;
+            this.archiveImportService = archiveImportService;
         }
 
         public Path dir() { return dir; }
@@ -52,6 +68,10 @@ public final class AuditTestSupport {
         public AuditService auditService() { return auditService; }
         public LocalReceiverClient receiver() { return receiver; }
         public ExportService exportService() { return exportService; }
+        public ArchiveKeyService archiveKeys() { return archiveKeyService; }
+        public ArchiveVerifier archiveVerifier() { return archiveVerifier; }
+        public ArchiveExportService archiveExporter() { return archiveExportService; }
+        public ArchiveImportService archiveImporter() { return archiveImportService; }
 
         public AuditEventBuilder events() {
             if (builder == null) {
@@ -105,7 +125,39 @@ public final class AuditTestSupport {
         AuditService audit = new AuditService(store, hasher, masking);
         LocalReceiverClient receiver = new LocalReceiverClient();
         ExportService exporter = new ExportService(audit, receiver);
-        return new Harness(dir, mapper, hasher, store, masking, audit, receiver, exporter);
+        ArchiveKeyService keyService = new ArchiveKeyService(props);
+        ArchiveVerifier verifier = new ArchiveVerifier(hasher);
+        ArchiveExportService archiveExporter = new ArchiveExportService(store, hasher, keyService, mapper);
+        ArchiveImportService archiveImporter = new ArchiveImportService(verifier, audit, mapper);
+        return new Harness(dir, mapper, hasher, store, masking, audit, receiver, exporter,
+                keyService, verifier, archiveExporter, archiveImporter);
+    }
+
+    /**
+     * 绕过 AuditService.append 直接构造一条完整合法链（O(n)，供大规模测试快速造数）。
+     * 事件内容不经脱敏（payload 均非敏感字段），链节与锚点与正常写入一致。
+     */
+    public static void appendChainDirectly(Harness h, int count) {
+        String prevHash = ChainHasher.GENESIS_HASH;
+        String headHash = null;
+        AuditEvent last = null;
+        for (int i = 1; i <= count; i++) {
+            AuditEvent candidate = new AuditEvent("bulk-" + i, i, 1700000000000L + i,
+                    "loader", "LOAD", "bulk",
+                    payload("index", String.valueOf(i)), 1, prevHash, "");
+            String hash = h.hasher().computeHash(candidate);
+            last = new AuditEvent(candidate.eventId(), candidate.seq(), candidate.timestamp(),
+                    candidate.actor(), candidate.action(), candidate.resource(),
+                    candidate.payload(), candidate.policyVersion(), candidate.prevHash(), hash);
+            h.store().append(last);
+            if (headHash == null) {
+                headHash = hash;
+            }
+            prevHash = hash;
+        }
+        if (last != null) {
+            h.store().writeAnchor(new Anchor(1, headHash, last.seq(), last.hash(), count));
+        }
     }
 
     public static Map<String, String> payload(String... kv) {

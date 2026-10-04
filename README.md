@@ -9,7 +9,7 @@
 ```bash
 mvn spring-boot:run                       # 默认数据目录 ./audit-data
 AUDIT_DATA_DIR=/tmp/audit mvn spring-boot:run   # 自定义数据目录
-mvn test                                  # 28 个单测（含篡改/截断/重复/并发/存储异常）
+mvn test                                  # 54 个单测（含篡改/截断/重复/并发/存储异常/归档包）
 ```
 
 数据目录包含三类文件：
@@ -19,6 +19,7 @@ mvn test                                  # 28 个单测（含篡改/截断/重�
 | `events.jsonl` | 每行一条事件 JSON，仅追加（链本体） |
 | `anchor.json` | 链头/链尾锚点（headSeq/headHash/tailSeq/tailHash/count），独立持久化 |
 | `policy.json` | 当前脱敏策略（版本号 + 敏感字段集合 + 掩码 token） |
+| `archive-signing.key` / `archive-signing.pub` | 本环境的归档签名密钥对（Ed25519，首次启动生成；私钥不出环境） |
 | `compact.intent` / `*.tmp` | 按批次清理与原子写的崩溃恢复临时文件（正常运行后自动消失） |
 
 ## 2. 完整性校验方式
@@ -103,7 +104,97 @@ k1=v1&k2=v2...
 - 接收端以 eventId 幂等，乱序、重复投递均安全（`POST /audit/export/order` 可指定投递顺序）。
 - `POST /audit/receiver/failing?failing=true|false` 模拟接收端故障，`/receiver/reset` 清空幂等记忆。
 
-## 6. HTTP 接口一览
+## 6. 归档包（离线核验与跨环境导入）
+
+把指定序号区间导出为一个**自包含、带签名**的归档包（单个 JSON 文件）。审计方拿到
+“包 + 来源环境公钥”即可完全离线地判断这段记录是否完整、是否被改动；也可以把包导入
+另一套（或已清空的）环境继续使用。
+
+### 6.1 包格式与防伪造
+
+```json
+{
+  "manifest": { "format": "audit-archive", "version": 1, "archiveId": "...",
+                "environmentId": "env-...", "createdAt": 0,
+                "fromSeq": 3, "toSeq": 7, "count": 5,
+                "precedingHash": "...", "headHash": "...", "tailHash": "...",
+                "policyVersions": [1] },
+  "events":   [ /* 区间内事件本体，与落盘字节一致 */ ],
+  "signature": "<Ed25519(清单规范化串)，Base64>"
+}
+```
+
+- 每个环境持有一对 Ed25519 密钥（`archive-signing.key/.pub`，首次启动生成）。
+  **environmentId = "env-" + SHA-256(公钥) 前 16 位十六进制**，完全由公钥派生。
+- 签名只覆盖清单；事件本体由清单里的 `precedingHash/headHash/tailHash` 与事件自身的
+  链式哈希共同绑定（改任一事件都会破坏哈希链或清单绑定）。
+- 伪造者没有私钥就无法造出能通过核验的包；把别的环境的包拿来顶替，签名无法用
+  本环境公钥核验通过。公钥带外交付（`GET /audit/archive/public-key`）。
+- 包内事件即当时落盘的内容（含当时的脱敏值与 policyVersion），因此**之后调整脱敏
+  策略、或来源环境做了保留期清理，都不会改变已导出包的核验结论**。
+
+### 6.2 导出
+
+`POST /audit/archive/export?fromSeq=3&toSeq=7[&out=/tmp/pkg.json]`
+（不给 `out` 时响应里以 Base64 返回包字节）。导出前对整条链做单趟流式校验
+（内存 O(1)，耗时随链规模线性），结论可区分：
+
+| 结论 | 含义 |
+| --- | --- |
+| `EXPORTED` | 导出成功 |
+| `EMPTY_CHAIN` | 链为空，无可导出记录（不产出包） |
+| `RANGE_PRUNED` | 区间起点已被保留期清理 |
+| `RANGE_NOT_FOUND` | 区间超出链尾 |
+| `INTEGRITY_FAILED` | 本地链校验未通过，拒绝导出（携带 issues） |
+
+### 6.3 离线核验
+
+`POST /audit/archive/verify?path=<包文件>&keyPath=<来源公钥文件>`，或直接用
+`ArchiveVerifier.verify(packageBytes, publicKey)`（不依赖本服务任何运行时数据）。
+结论彼此可区分（`ArchiveConclusion`）：
+
+| 结论 | 触发手段 |
+| --- | --- |
+| `VALID` | 签名有效，全部事件哈希/序号/链节/清单绑定复算一致 |
+| `MALFORMED_PACKAGE` | 包文件被截断/损坏/格式版本不符 |
+| `SIGNATURE_INVALID` | 掉包、伪造（含拿别的环境的包顶替） |
+| `ENVIRONMENT_MISMATCH` | 签名有效但清单环境标识与公钥派生标识不符 |
+| `CONTENT_TAMPERED` | 条目内容被改（含改后重算哈希、混入清单外记录、整体替换） |
+| `RECORDS_DELETED` | 区间内有记录被删除（序号出现空洞） |
+| `TAIL_TRUNCATED` | 尾部被截：现存部分是声明区间的合法前缀但数量不足 |
+| `ORDER_SHUFFLED` | 记录一条不缺但顺序被打乱 |
+
+### 6.4 导入
+
+`POST /audit/archive/import?path=<包文件>&keyPath=<来源公钥文件>`。
+每条源事件包装为一条本地事件追加到链尾（与本地已有记录并存于同一条链），
+原始事件 JSON 逐字节保留在 payload 的 `_importOriginalEvent` 字段，
+本地事件 id 为确定性的 `imp-<archiveId>-<原eventId>`。结论可区分（`ImportOutcome`）：
+
+| 结论 | 含义 |
+| --- | --- |
+| `IMPORTED` | 有新记录导入 |
+| `ALREADY_IMPORTED` | 幂等命中：包中记录此前已全部导入，零改动 |
+| `PACKAGE_INVALID` | 包本身完整性有问题（核验未通过），本地零改动 |
+| `LOCAL_CHAIN_INVALID` | 本地链当前不完整，拒绝导入，本地零改动 |
+| `IMPORT_STORAGE_FAILED` | 接收/存储中途出错，已回滚到导入前状态，可安全重试 |
+
+- **幂等**：同一包反复导入结果相同，不会多出记录，链保持有效。
+- **原子**：整批导入先一次性校验本地链，然后批量追加并一次刷新锚点；中途存储失败
+  用 `pruneAfter` 把链截回导入前状态并恢复锚点（与按批次清理共用同一套
+  意图日志崩溃恢复机制），本地已有记录零影响。
+- 包完整性问题（`PACKAGE_INVALID`）与本地接收/存储问题（`IMPORT_STORAGE_FAILED`）
+  是两类不同结论：前者找对方核对，后者直接重试。
+
+### 6.5 兼容范围
+
+- 包格式 `format=audit-archive, version=1`；核验端只接受同格式同版本的包。
+- 事件的哈希规范化算法与主链一致（SHA-256，见 2.1）；跨环境导入只要求双方运行
+  同一版本的本服务，不要求共享存储、策略或密钥。
+- 环境身份即密钥对：数据目录整体清空后重新初始化的环境是新身份，旧包仍可用
+  旧公钥离线核验，但不会被误认为是新环境所出。
+
+## 7. HTTP 接口一览
 
 | 方法 路径 | 说明 |
 | --- | --- |
@@ -112,6 +203,10 @@ k1=v1&k2=v2...
 | `GET /audit/verify` | 完整性校验，返回 VerificationReport |
 | `POST /audit/retain?keepBatches=&batchSize=` | 按批次保留 |
 | `POST /audit/export` / `POST /audit/export/order` | 导出（顺序导出/乱序重放） |
+| `POST /audit/archive/export?fromSeq=&toSeq=[&out=]` | 导出区间为签名归档包 |
+| `GET /audit/archive/public-key` | 查看本环境标识与归档公钥（带外交付） |
+| `POST /audit/archive/verify?path=&keyPath=` | 离线核验归档包 |
+| `POST /audit/archive/import?path=&keyPath=` | 导入归档包（幂等、原子） |
 | `GET/POST /audit/policy` | 查看/更新脱敏策略 |
 | `POST /audit/receiver/failing` / `/receiver/reset` | 模拟接收端控制 |
 
@@ -135,6 +230,11 @@ mvn test
   按批次保留后校验通过、保留后重启续写
 - `ExportTest`：首次投递/重复忽略、乱序重放、接收端故障与完整性失败严格区分且本地零改动
 - `StorageFailureAndRecoveryTest`：不可写目录、半截行恢复、锚点落后自动对账、清理后崩溃恢复
+- `ArchiveOfflineVerificationTest`：各类破坏的离线核验结论（改内容/删记录/截尾/乱序/
+  伪造/跨环境顶替/标识不符/包截断）、空链/单条/区间已清理、策略变更与源端清理不影响旧包
+- `ArchiveImportTest`：空环境导入、重复导入幂等、与本地记录并存、坏包零改动、
+  导入中途存储故障回滚且可重试、本地链破损拒绝导入
+- `ArchiveScaleTest`：2 万条链上导出 1 万条区间、离线核验与导入的耗时（秒级以内）
 
 ### 7.2 手工端到端
 
@@ -146,4 +246,21 @@ curl -s -X POST localhost:8080/audit/events -H 'Content-Type: application/json' 
 curl -s localhost:8080/audit/verify
 # 直接编辑 audit-data/events.jsonl 改一个字段后：
 curl -s localhost:8080/audit/verify     # valid=false, issues 中给出具体原因与定位
+```
+
+### 7.3 归档包手工验证
+
+```bash
+# 1) 追加若干事件后，导出区间 [1,3] 到文件，并取本环境公钥
+curl -s -X POST 'localhost:8080/audit/archive/export?fromSeq=1&toSeq=3&out=/tmp/pkg.json'
+curl -s localhost:8080/audit/archive/public-key | jq -r .publicKeyBase64 > /tmp/env.pub
+
+# 2) 离线核验（可换一台机器、或先停掉服务，只凭 包+公钥）
+curl -s -X POST 'localhost:8080/audit/archive/verify?path=/tmp/pkg.json&keyPath=/tmp/env.pub'
+#   -> conclusion=VALID；改包内任一字段再核验 -> CONTENT_TAMPERED 等具体结论
+
+# 3) 导入到另一套环境（AUDIT_DATA_DIR=/tmp/audit-b 另起一个实例）
+curl -s -X POST 'localhost:8081/audit/archive/import?path=/tmp/pkg.json&keyPath=/tmp/env.pub'
+#   -> IMPORTED；再发一次 -> ALREADY_IMPORTED，记录数不变
+curl -s localhost:8081/audit/verify     # 导入后的本地链校验通过
 ```

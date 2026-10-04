@@ -32,7 +32,7 @@ import java.util.List;
 @Component
 public class FileAuditStore implements AuditStore {
 
-    private record CompactIntent(long keepBeforeSeq) {
+    private record CompactIntent(long keepBeforeSeq, long keepMaxSeq) {
     }
 
     private final Path dir;
@@ -102,6 +102,44 @@ public class FileAuditStore implements AuditStore {
     }
 
     @Override
+    public java.util.stream.Stream<AuditEvent> streamEvents() {
+        if (!Files.exists(eventsFile)) {
+            return java.util.stream.Stream.empty();
+        }
+        final java.io.BufferedReader reader;
+        try {
+            reader = Files.newBufferedReader(eventsFile);
+        } catch (IOException e) {
+            throw new AuditStoreException("读取审计链文件失败", e);
+        }
+        final int[] lineNo = {0};
+        return reader.lines()
+                .map(line -> {
+                    lineNo[0]++;
+                    if (line.isBlank()) {
+                        throw new AuditStoreException("审计链文件第 " + lineNo[0] + " 行为空，疑似损坏");
+                    }
+                    try {
+                        AuditEvent event = mapper.readValue(line, AuditEvent.class);
+                        if (event.eventId() == null || event.hash() == null) {
+                            throw new AuditStoreException("审计链文件第 " + lineNo[0] + " 行缺少必要字段");
+                        }
+                        return event;
+                    } catch (IOException e) {
+                        throw new AuditStoreException(
+                                "审计链文件第 " + lineNo[0] + " 行无法解析，疑似损坏/篡改", e);
+                    }
+                })
+                .onClose(() -> {
+                    try {
+                        reader.close();
+                    } catch (IOException e) {
+                        throw new AuditStoreException("关闭审计链文件失败", e);
+                    }
+                });
+    }
+
+    @Override
     public synchronized Anchor readAnchor() {
         if (!Files.exists(anchorFile)) {
             return Anchor.empty();
@@ -136,10 +174,30 @@ public class FileAuditStore implements AuditStore {
             return all;
         }
         try {
-            atomicWriteJson(intentFile, new CompactIntent(keepBeforeSeq));
+            atomicWriteJson(intentFile, new CompactIntent(keepBeforeSeq, Long.MAX_VALUE));
             return finishCompaction();
         } catch (IOException e) {
             throw new AuditStoreException("按批次清理失败", e);
+        }
+    }
+
+    /**
+     * 截断尾部：删除 seq &gt; keepSeq 的事件。与 pruneBefore 共用同一套
+     * 意图日志 + 原子重写机制，中途崩溃后重启会推进到完成。
+     *
+     * @return 保留的事件
+     */
+    @Override
+    public synchronized List<AuditEvent> pruneAfter(long keepSeq) {
+        List<AuditEvent> all = readAll();
+        if (all.isEmpty() || all.get(all.size() - 1).seq() <= keepSeq) {
+            return all;
+        }
+        try {
+            atomicWriteJson(intentFile, new CompactIntent(1L, keepSeq));
+            return finishCompaction();
+        } catch (IOException e) {
+            throw new AuditStoreException("尾部截断失败", e);
         }
     }
 
@@ -178,15 +236,19 @@ public class FileAuditStore implements AuditStore {
     private List<AuditEvent> finishCompaction() throws IOException {
         CompactIntent intent = mapper.readValue(Files.readAllBytes(intentFile), CompactIntent.class);
         long keepBeforeSeq = intent.keepBeforeSeq();
+        long keepMaxSeq = intent.keepMaxSeq();
 
         List<AuditEvent> all = Files.exists(eventsFile) ? readAll() : List.of();
-        boolean alreadyRewritten = all.stream().allMatch(e -> e.seq() >= keepBeforeSeq);
+        boolean alreadyRewritten = all.stream()
+                .allMatch(e -> e.seq() >= keepBeforeSeq && e.seq() <= keepMaxSeq);
 
         List<AuditEvent> retained;
         if (alreadyRewritten) {
             retained = all;
         } else {
-            retained = all.stream().filter(e -> e.seq() >= keepBeforeSeq).toList();
+            retained = all.stream()
+                    .filter(e -> e.seq() >= keepBeforeSeq && e.seq() <= keepMaxSeq)
+                    .toList();
             Path tmp = dir.resolve("events.jsonl.tmp");
             writeEvents(tmp, retained);
             moveAtomically(tmp, eventsFile);

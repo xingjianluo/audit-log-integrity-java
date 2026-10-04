@@ -100,6 +100,82 @@ public class AuditService {
     }
 
     /**
+     * 原子批量追加外部事件（归档导入用）。
+     *
+     * <ul>
+     *   <li>前置校验本地链完整，否则抛 {@link IntegrityException}，零写入；</li>
+     *   <li>以 eventId 幂等：已存在的事件静默跳过（重复导入不产生重复记录）；</li>
+     *   <li>要么整批追加成功并一次性刷新锚点，要么在存储失败时把链回滚到
+     *       追加前状态（{@code pruneAfter} 截断已写入的尾部并恢复锚点），
+     *       本地已有记录零影响；</li>
+     *   <li>整批只做一次全链校验，避免逐条追加的 O(n²) 开销。</li>
+     * </ul>
+     *
+     * @return 实际新追加的事件（不含幂等跳过的）
+     */
+    public List<AuditEvent> appendExternalBatch(List<EventInput> batch) {
+        synchronized (writeLock) {
+            CheckedChain chain = loadAndCheck();
+            if (!chain.report.valid()) {
+                throw new IntegrityException("本地链完整性校验未通过，拒绝批量导入", chain.report);
+            }
+            List<AuditEvent> events = chain.events;
+            java.util.Set<String> existingIds = new java.util.HashSet<>();
+            events.forEach(e -> existingIds.add(e.eventId()));
+
+            MaskingPolicy policy = maskingService.current();
+            long nextSeq = events.isEmpty() ? 1L : events.get(events.size() - 1).seq() + 1;
+            String prevHash = events.isEmpty() ? ChainHasher.GENESIS_HASH
+                    : events.get(events.size() - 1).hash();
+            List<AuditEvent> toAppend = new ArrayList<>();
+            for (EventInput input : batch) {
+                if (input == null || input.eventId() == null || input.eventId().isBlank()) {
+                    throw new IllegalArgumentException("批量导入事件的 eventId 不能为空");
+                }
+                if (!existingIds.add(input.eventId())) {
+                    continue; // 已导入过或批内重复：幂等跳过
+                }
+                AuditEvent candidate = new AuditEvent(
+                        input.eventId(), nextSeq, System.currentTimeMillis(),
+                        input.actor(), input.action(), input.resource(),
+                        maskingService.mask(input.payload(), policy), policy.version(),
+                        prevHash, "");
+                String hash = hasher.computeHash(candidate);
+                AuditEvent event = new AuditEvent(candidate.eventId(), candidate.seq(),
+                        candidate.timestamp(), candidate.actor(), candidate.action(),
+                        candidate.resource(), candidate.payload(), candidate.policyVersion(),
+                        candidate.prevHash(), hash);
+                toAppend.add(event);
+                prevHash = hash;
+                nextSeq++;
+            }
+            if (toAppend.isEmpty()) {
+                log.info("批量导入: 全部 {} 条均已存在，幂等跳过，本地零改动", batch.size());
+                return List.of();
+            }
+
+            long preTailSeq = events.isEmpty() ? 0L : events.get(events.size() - 1).seq();
+            try {
+                for (AuditEvent e : toAppend) {
+                    store.append(e);
+                }
+            } catch (RuntimeException storeFailure) {
+                log.error("批量导入中途存储失败，回滚到 seq={}: {}", preTailSeq, storeFailure.getMessage());
+                store.pruneAfter(preTailSeq);
+                throw storeFailure;
+            }
+
+            AuditEvent head = events.isEmpty() ? toAppend.get(0) : events.get(0);
+            AuditEvent tail = toAppend.get(toAppend.size() - 1);
+            store.writeAnchor(new Anchor(head.seq(), head.hash(), tail.seq(), tail.hash(),
+                    events.size() + toAppend.size()));
+            log.info("批量导入完成: 新增 {} 条, 幂等跳过 {} 条, 链尾 seq={}",
+                    toAppend.size(), batch.size() - toAppend.size(), tail.seq());
+            return List.copyOf(toAppend);
+        }
+    }
+
+    /**
      * 校验整条链。校验过程同时对“文件已追加但锚点落后”的合法崩溃状态做对账修复。
      */
     public VerificationReport verify() {
