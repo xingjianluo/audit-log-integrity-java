@@ -92,22 +92,10 @@ public class AuditController {
         return archiveService.verify(java.nio.file.Path.of(path), expectedEnv);
     }
 
-    /** 幂等导入归档包，与本地链并存 */
+    /** 幂等导入归档包：核验通过后并入本地链，成为本环境自己的记录 */
     @PostMapping("/archive/import")
     public ArchiveImportResult importArchive(@RequestParam String path) {
         return archiveService.importArchive(java.nio.file.Path.of(path));
-    }
-
-    /** 已导入的归档段列表 */
-    @GetMapping("/archive/imports")
-    public List<String> listImports() {
-        return archiveService.listImports();
-    }
-
-    /** 核验某个已导入的归档段 */
-    @PostMapping("/archive/imports/verify")
-    public ArchiveVerification verifyImported(@RequestParam String storedAs) {
-        return archiveService.verifyImported(storedAs);
     }
 
     /** 测试用：模拟接收端故障开关 */

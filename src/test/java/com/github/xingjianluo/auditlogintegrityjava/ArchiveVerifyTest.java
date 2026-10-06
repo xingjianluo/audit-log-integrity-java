@@ -240,6 +240,19 @@ class ArchiveVerifyTest {
     }
 
     @Test
+    void missingPackageFileIsPackageUnreadableNotMalformed() {
+        var h = envA();
+        Path missing = dir.resolve("no-such-file.json");
+        log.info("[输入] 核验一个不存在的包文件");
+
+        ArchiveVerification v = h.archiveService().verify(missing, null);
+        logVerdict("文件不存在", v);
+        assertFalse(v.valid());
+        assertEquals(ArchiveFailureReason.PACKAGE_UNREADABLE, v.primaryReason(),
+                "文件不存在是接收侧问题，不得误判为包内容损坏");
+    }
+
+    @Test
     void historicalVerdictSurvivesPolicyChangeAndRetentionCleanup() {
         var h = envA();
         Path archive = exportSample(h, 10, 2, 9);

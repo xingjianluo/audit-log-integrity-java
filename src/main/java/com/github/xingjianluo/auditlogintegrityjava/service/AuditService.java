@@ -15,7 +15,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -145,6 +147,116 @@ public class AuditService {
     public List<AuditEvent> readAll() {
         synchronized (writeLock) {
             return store.readAll();
+        }
+    }
+
+    /**
+     * 把归档包中的事件并入本地链，使其成为本环境自己的记录。
+     *
+     * <p>并入规则（全部在同一把写锁内完成，与追加/清理/其他导入互斥）：
+     * <ul>
+     *   <li>本地链校验不通过 → CHAIN_INVALID，零改动；</li>
+     *   <li>本环境自己导出的区间若已被保留期清理（包起点早于当前链头）
+     *       → PRUNED_RANGE，拒绝让已清理记录复活，零改动；</li>
+     *   <li>幂等：并入后的事件以 {@code 来源环境:原eventId} 落库（本环境包也兼容匹配原 id），
+     *       全部已存在 → DUPLICATE_IGNORED；部分已存在 → 跳过已有、只补缺失，
+     *       结果与一次性并入相同；</li>
+     *   <li>同一事件 ID 内容不一致 → EVENT_CONFLICT，零改动；</li>
+     *   <li>写入：重链（新 seq、新 prevHash、本地复算 hash，其余字段原样保留）后
+     *       整体重写链文件 + 刷新锚点，中途失败原有记录一字节不变。</li>
+     * </ul>
+     *
+     * @param sourceEnvironmentId 包来源环境 id（用于生成并入事件的限定 id）
+     * @param sameEnvironment     包是否来自本环境（本环境包按原始 eventId 判重，并做清理区间检查）
+     * @param imported            包内事件（已通过离线核验，顺序与包内一致）
+     */
+    public ImportMergeResult mergeImported(String sourceEnvironmentId, boolean sameEnvironment,
+                                           List<AuditEvent> imported) {
+        if (imported == null || imported.isEmpty()) {
+            throw new IllegalArgumentException("并入事件列表不能为空");
+        }
+        synchronized (writeLock) {
+            CheckedChain chain = loadAndCheck();
+            List<AuditEvent> events = chain.events;
+            if (!chain.report.valid()) {
+                log.warn("归档并入拒绝: 本地链完整性校验未通过, 问题数={}", chain.report.issues().size());
+                return new ImportMergeResult(ImportMergeOutcome.CHAIN_INVALID, 0, events.size(),
+                        "本地审计链完整性校验未通过，拒绝在破损链上并入（本地记录零改动）");
+            }
+            if (sameEnvironment && !events.isEmpty()
+                    && imported.get(0).seq() < events.get(0).seq()) {
+                log.warn("归档并入拒绝: 本环境区间起点 seq={} 早于当前链头 seq={}，该段已被保留期清理",
+                        imported.get(0).seq(), events.get(0).seq());
+                return new ImportMergeResult(ImportMergeOutcome.PRUNED_RANGE, 0, events.size(),
+                        "包内区间 [" + imported.get(0).seq() + "," + imported.get(imported.size() - 1).seq()
+                                + "] 是本环境已被保留期清理的区段（当前链头 seq=" + events.get(0).seq()
+                                + "），为避免已清理记录复活，拒绝并入（本地记录零改动）");
+            }
+
+            Map<String, AuditEvent> byId = new HashMap<>();
+            for (AuditEvent e : events) {
+                byId.put(e.eventId(), e);
+            }
+            List<AuditEvent> missing = new ArrayList<>();
+            for (AuditEvent e : imported) {
+                String qualifiedId = sourceEnvironmentId + ":" + e.eventId();
+                AuditEvent existing = byId.get(qualifiedId);
+                if (existing == null && sameEnvironment) {
+                    existing = byId.get(e.eventId());
+                }
+                if (existing != null) {
+                    if (!sameIdentity(existing, e)) {
+                        log.warn("归档并入拒绝: 事件 {} 与本地已有记录 {} 内容冲突", e.eventId(), existing.eventId());
+                        return new ImportMergeResult(ImportMergeOutcome.EVENT_CONFLICT, 0, events.size(),
+                                "包内事件 " + e.eventId() + " 与本地已有记录 " + existing.eventId()
+                                        + " 事件 ID 相同但内容不同，存在矛盾（本地记录零改动），应与提供方核对");
+                    }
+                    continue; // 已在本地：幂等跳过
+                }
+                missing.add(e);
+                byId.put(qualifiedId, e); // 包内重复 id 按同一批幂等处理
+            }
+            if (missing.isEmpty()) {
+                log.info("归档并入幂等忽略: 来源={}, 包内 {} 条全部已在本地链中", sourceEnvironmentId, imported.size());
+                return new ImportMergeResult(ImportMergeOutcome.DUPLICATE_IGNORED, 0, events.size(),
+                        "这批记录已全部并入过本地链，幂等忽略，未新增记录");
+            }
+
+            // 重链：并入事件获得本环境的新 seq / prevHash / hash，业务字段原样保留
+            long seq = events.isEmpty() ? 1L : events.get(events.size() - 1).seq() + 1;
+            String prevHash = events.isEmpty() ? ChainHasher.GENESIS_HASH
+                    : events.get(events.size() - 1).hash();
+            List<AuditEvent> merged = new ArrayList<>(events.size() + missing.size());
+            merged.addAll(events);
+            for (AuditEvent e : missing) {
+                AuditEvent candidate = new AuditEvent(
+                        sourceEnvironmentId + ":" + e.eventId(), seq, e.timestamp(),
+                        e.actor(), e.action(), e.resource(),
+                        e.payload(), e.policyVersion(), prevHash, "");
+                String hash = hasher.computeHash(candidate);
+                merged.add(new AuditEvent(candidate.eventId(), candidate.seq(), candidate.timestamp(),
+                        candidate.actor(), candidate.action(), candidate.resource(),
+                        candidate.payload(), candidate.policyVersion(), candidate.prevHash(), hash));
+                prevHash = hash;
+                seq++;
+            }
+
+            store.rewriteAll(merged);
+            AuditEvent head = merged.get(0);
+            AuditEvent tail = merged.get(merged.size() - 1);
+            store.writeAnchor(new Anchor(head.seq(), head.hash(), tail.seq(), tail.hash(), merged.size()));
+
+            VerificationReport after = loadAndCheck().report;
+            if (!after.valid()) {
+                // 构造上不应发生：若发生说明实现有缺陷，按内部错误上抛而非假装成功
+                throw new IllegalStateException("并入后链校验未通过: " + after.issues());
+            }
+            log.info("归档并入完成: 来源={}, 新并入={} 条, 跳过已有={} 条, 本地链总数={}, 新区间尾 seq={}",
+                    sourceEnvironmentId, missing.size(), imported.size() - missing.size(),
+                    merged.size(), tail.seq());
+            return new ImportMergeResult(ImportMergeOutcome.MERGED, missing.size(), merged.size(),
+                    "已把 " + missing.size() + " 条记录并入本地链（事件 ID 以 " + sourceEnvironmentId
+                            + ": 前缀落库），可与本地记录一起查询、整体校验通过、可继续追加");
         }
     }
 
@@ -293,6 +405,12 @@ public class AuditService {
         return Objects.equals(existing.actor(), input.actor())
                 && Objects.equals(existing.action(), input.action())
                 && Objects.equals(existing.resource(), input.resource());
+    }
+
+    private static boolean sameIdentity(AuditEvent a, AuditEvent b) {
+        return Objects.equals(a.actor(), b.actor())
+                && Objects.equals(a.action(), b.action())
+                && Objects.equals(a.resource(), b.resource());
     }
 
     private static void validate(EventInput input) {

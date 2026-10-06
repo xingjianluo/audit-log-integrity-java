@@ -59,7 +59,9 @@ public record ArchiveVerification(
             case LINK_MISMATCH -> 9;
             case MANIFEST_MISMATCH -> 10;
             case SIGNATURE_MISMATCH -> 11;
-            case OK -> 12;
+            case PACKAGE_UNREADABLE -> 12;
+            case INTERNAL_ERROR -> 13;
+            case OK -> 14;
         };
     }
 }

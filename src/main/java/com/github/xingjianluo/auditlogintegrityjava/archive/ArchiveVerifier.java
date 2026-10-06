@@ -1,6 +1,7 @@
 package com.github.xingjianluo.auditlogintegrityjava.archive;
 
 import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.auditlogintegrityjava.chain.AuditEvent;
@@ -81,7 +82,7 @@ public class ArchiveVerifier {
                     default -> p.skipChildren();
                 }
             }
-        } catch (Exception e) {
+        } catch (JsonProcessingException e) {
             // 物理截断（JSON 未写完）与其余结构损坏区分开；
             // 解析中途失败时，后续字段“缺失”只是截断的后果，不再叠加 MALFORMED 判定
             s.parseFailed = true;
@@ -89,6 +90,16 @@ public class ArchiveVerifier {
             return finish(s.withIssue(
                     truncated ? ArchiveFailureReason.TRUNCATED : ArchiveFailureReason.MALFORMED_PACKAGE,
                     null, null, "包文件解析失败: " + e.getMessage()), expectedEnvironmentId);
+        } catch (IOException e) {
+            // 文件不存在/不可读：接收侧问题，与包内容无关，不判成“包损坏”；
+            // 直接给出唯一结论，不再叠加格式/元数据等基于内容的判定
+            return single(ArchiveFailureReason.PACKAGE_UNREADABLE,
+                    "包文件不存在或无法读取: " + e.getMessage());
+        } catch (Exception e) {
+            // 未预料的内部错误：明确归类，不混为“包损坏”，也不向上抛未归类异常
+            log.error("归档包核验出现未预料的内部错误", e);
+            return single(ArchiveFailureReason.INTERNAL_ERROR,
+                    "核验过程出现未预料的内部错误: " + e);
         }
         return finish(s, expectedEnvironmentId);
     }
@@ -155,6 +166,13 @@ public class ArchiveVerifier {
                     "序号 " + s.pendingGaps.first() + " 起共 " + s.pendingGaps.size()
                             + " 条记录缺失，中间记录被删除");
         }
+    }
+
+    private ArchiveVerification single(ArchiveFailureReason reason, String detail) {
+        ArchiveVerification result = ArchiveVerification.invalid(null, 0, 0, 0,
+                List.of(new ArchiveIssue(reason, null, null, detail)));
+        log.info("归档包离线核验: 结论=无效, 主因={}, 判定依据={}", reason, detail);
+        return result;
     }
 
     private ArchiveVerification finish(State s, String expectedEnvironmentId) {

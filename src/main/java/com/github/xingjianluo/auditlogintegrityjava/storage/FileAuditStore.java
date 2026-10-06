@@ -145,6 +145,21 @@ public class FileAuditStore implements AuditStore {
 
     // ---- 崩溃恢复 ----
 
+    /**
+     * 整体重写链文件：先写临时文件再原子移动，任何一步失败原文件都保持不变。
+     * 调用方随后刷新锚点；崩溃窗口留下的“锚点落后”形态由校验侧对账修复。
+     */
+    @Override
+    public synchronized void rewriteAll(List<AuditEvent> events) {
+        try {
+            Path tmp = dir.resolve("events.jsonl.tmp");
+            writeEvents(tmp, events);
+            moveAtomically(tmp, eventsFile);
+        } catch (IOException e) {
+            throw new AuditStoreException("整体重写审计链文件失败", e);
+        }
+    }
+
     private void truncatePartialLastLine() throws IOException {
         if (!Files.exists(eventsFile) || Files.size(eventsFile) == 0) {
             return;

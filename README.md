@@ -2,7 +2,8 @@
 
 一条可本地验证的安全审计链路：事件顺序追加形成密码学完整性链，敏感字段落盘前按版本化策略
 不可逆脱敏，支持按批次保留清理，可向本地模拟接收端做幂等导出，并可把指定区间打包成
-**自包含归档包**交给外部审计方离线核验、或幂等导入另一套环境并存使用。在并发写入、策略变更、
+**自包含归档包**交给外部审计方离线核验、或幂等导入另一套环境——导入后这批记录就成为
+该环境自己的记录，与原有记录一起查询、整体校验、继续追加。在并发写入、策略变更、
 存储异常与接收端故障下，结论保持一致且失败原因可区分、可解释。
 
 ## 1. 目录与运行
@@ -10,7 +11,7 @@
 ```bash
 mvn spring-boot:run                       # 默认数据目录 ./audit-data
 AUDIT_DATA_DIR=/tmp/audit mvn spring-boot:run   # 自定义数据目录
-mvn test                                  # 48 个单测（含篡改/截断/重复/并发/存储异常/归档包）
+mvn test                                  # 58 个单测（含篡改/截断/重复/并发/存储异常/归档包）
 ```
 
 数据目录包含三类文件：
@@ -22,7 +23,6 @@ mvn test                                  # 48 个单测（含篡改/截断/重�
 | `policy.json` | 当前脱敏策略（版本号 + 敏感字段集合 + 掩码 token） |
 | `compact.intent` / `*.tmp` | 按批次清理与原子写的崩溃恢复临时文件（正常运行后自动消失） |
 | `archives/` | 导出的自包含归档包（单文件 JSON） |
-| `imports/` | 从外部导入的归档段，与本地链分离存放、并存使用 |
 
 ## 2. 完整性校验方式
 
@@ -141,7 +141,9 @@ curl -s -X POST "localhost:8080/audit/archive/export?fromSeq=3&toSeq=8"
 导出结论（`ArchiveExportOutcome`）：`EXPORTED`（生成成功，archiveFile 给出路径）、
 `EMPTY_CHAIN`（空链，明确区别于"成功导出空包"）、`RANGE_UNAVAILABLE`（区间起点已被
 保留期清理或尚未到达；上界自动裁剪到当前链尾）、`INTEGRITY_FAILED`（本地链校验未通过，
-拒绝导出）、`STORAGE_FAILED`（写文件失败，可重试）。把生成的单个 JSON 文件交给审计方即可。
+拒绝导出）、`STORAGE_FAILED`（写文件失败，可重试）、`CONFIGURATION_MISSING`
+（未配置 `audit.archive-key`，先补配置）、`INTERNAL_ERROR`（未预料的内部错误，携带详情）。
+把生成的单个 JSON 文件交给审计方即可。
 
 ### 6.3 离线核验
 
@@ -164,23 +166,48 @@ curl -s -X POST "localhost:8080/audit/archive/verify?path=/path/to/archive.json&
 | `UNTRUSTED_ENVIRONMENT` | 没有该环境的核验密钥，来源不可信 |
 | `ENVIRONMENT_MISMATCH` | 包来自其他环境（跨环境顶替） |
 | `EMPTY_ARCHIVE` / `MALFORMED_PACKAGE` / `UNSUPPORTED_FORMAT` | 空包 / 结构损坏 / 不认识的格式版本 |
+| `PACKAGE_UNREADABLE` | 包文件不存在或无法读取（接收侧问题，与包内容无关） |
+| `INTERNAL_ERROR` | 核验过程出现未预料的内部错误 |
 
 ### 6.4 导入规则
 
 ```bash
 curl -s -X POST "localhost:8080/audit/archive/import?path=/path/to/archive.json"
-curl -s localhost:8080/audit/archive/imports            # 已导入段列表
-curl -s -X POST "localhost:8080/audit/archive/imports/verify?storedAs=imported-envA-1-4.json"
 ```
 
-- 导入段存放在 `imports/` 下，**不改写本地链**，与本地记录并存使用，可逐个独立核验。
-- **幂等**：同一环境同一区间的包重复导入任意次，结果与首次一致（`DUPLICATE_IGNORED`），
-  不新增记录、不动本地链。
-- **原子**：先核验、后整体复制 + 原子移动；一次导入要么整体成功，要么本地零影响。
-- 结论（`ArchiveImportOutcome`）：`IMPORTED` / `DUPLICATE_IGNORED` /
-  `INTEGRITY_REJECTED`（包本身有问题，应找对方核对而非重试）/
-  `UNTRUSTED_SOURCE`（来源环境不在信任列表）/ `STORAGE_FAILED`
-  （包有效但本地接收/存储失败，本地零改动，可重试）。
+**导入即并入**：核验通过后，包内事件按本地链规则重链（分配本环境的新 seq、
+接在本地链尾之后、本地复算哈希；actor/action/resource/payload/policyVersion/时间戳
+原样保留），成为本环境自己的记录。导入之后：
+
+- `GET /audit/events` 能查到这批记录（事件 ID 形如 `来源环境:原eventId`，
+  例如 `envA:evt-7`，既保留来源可追溯性，又不会与本环境自己的事件 ID 撞车）；
+- `GET /audit/verify` 整体校验照样通过；
+- 可以接着往后追加新事件，序号与链节正常延续；
+- 这批记录同样参与后续的归档导出与保留期清理（它们就是本环境的记录）。
+
+**导入规则与结论**（`ArchiveImportOutcome`，各类失败严格区分）：
+
+| 结论 | 含义与处置 |
+| --- | --- |
+| `IMPORTED` | 并入成功（`mergedCount` 条新记录，本地链总数 `totalEvents`） |
+| `DUPLICATE_IGNORED` | 同一批记录已并入过，幂等忽略：结果与首次一致，不重复堆记录、不动链 |
+| `INTEGRITY_REJECTED` | 包本身核验未通过（被改/被删/截断/伪造等），本地零改动——**找对方核对**，不要简单重试 |
+| `UNTRUSTED_SOURCE` | 没有来源环境的核验密钥——信任对方就把密钥配到 `audit.trusted-archive-keys.<env>`（本环境的包配 `audit.archive-key`），否则找对方核对 |
+| `PRUNED_RANGE` | 本环境自己导出的区间已被保留期清理，拒绝让已清理记录复活，本地零改动 |
+| `EVENT_CONFLICT` | 包内事件与本地已有记录同一事件 ID 但内容不同，存在矛盾，本地零改动——找对方核对 |
+| `LOCAL_CHAIN_INVALID` | 本地链完整性校验未通过，拒绝在破损链上并入，本地零改动——先修复本地 |
+| `STORAGE_FAILED` | 包本身有效，但本地接收/存储失败（含包文件不存在/不可读），本地零改动——**可重试** |
+| `INTERNAL_ERROR` | 未预料的内部错误（携带异常详情）——需排查，不要当作包问题 |
+
+- **幂等**：同一包不管导入多少次，结果都与第一次一致；部分区间已并入过的包，
+  只补缺失的记录，效果等同于一次性并入。
+- **原子**：并入采用"整体重写链文件 + 刷新锚点"，中途失败本地原有记录一字节不变；
+  崩溃窗口留下的"锚点落后"形态由校验侧自动对账。
+- **并发**：同一时刻并发导入同一个包由写锁串行化，只有一个真正并入
+  （`IMPORTED`），其余幂等忽略（`DUPLICATE_IGNORED`），不会重复写入或弄乱链。
+- **空环境**：导入空环境正常生效，记录从 seq=1 起成为该环境的链。
+- **本环境导回的包**：记录仍在链上 → `DUPLICATE_IGNORED`；区间已被清理 → `PRUNED_RANGE`；
+  环境已整体清空 → 视为空环境正常并入。
 
 ### 6.5 兼容范围
 
@@ -201,8 +228,7 @@ curl -s -X POST "localhost:8080/audit/archive/imports/verify?storedAs=imported-e
 | `POST /audit/receiver/failing` / `/receiver/reset` | 模拟接收端控制 |
 | `POST /audit/archive/export?fromSeq=&toSeq=` | 导出区间为自包含归档包 |
 | `POST /audit/archive/verify?path=&expectedEnv=` | 离线核验归档包 |
-| `POST /audit/archive/import?path=` | 幂等导入归档包 |
-| `GET /audit/archive/imports` / `POST /audit/archive/imports/verify?storedAs=` | 已导入段列表 / 核验 |
+| `POST /audit/archive/import?path=` | 幂等导入归档包（并入本地链） |
 
 错误响应体含 `errorType`：`INTEGRITY_FAILED` / `DUPLICATE_EVENT_CONFLICT` /
 `STORAGE_ERROR` / `BAD_REQUEST`，HTTP 状态码分别为 409/409/503/400。
@@ -225,9 +251,12 @@ mvn test
 - `ExportTest`：首次投递/重复忽略、乱序重放、接收端故障与完整性失败严格区分且本地零改动
 - `StorageFailureAndRecoveryTest`：不可写目录、半截行恢复、锚点落后自动对账、清理后崩溃恢复
 - `ArchiveVerifyTest`：离线核验面对内容被改/记录被删/截尾/物理截断/重排/伪造签名/清单被改/
-  自洽假包/跨环境顶替各自的结论；空链与单条链；区间已被清理；策略变更+清理后历史结论可复现
-- `ArchiveImportTest`：导入与本地链并存、重复导入幂等、篡改包拒绝且本地零改动、
-  未信任来源与存储故障可区分且可重试、空环境导入
+  自洽假包/跨环境顶替/文件不存在各自的结论；空链与单条链；区间已被清理；
+  策略变更+清理后历史结论可复现
+- `ArchiveImportTest`：导入后记录并入本地链（可查询/整体校验通过/可续写）、空环境导入、
+  重复导入幂等、并发导入同一包只并入一次、篡改包/未信任来源/文件不存在/存储故障/
+  本地链破损/事件冲突/已清理区间各有可区分结论且本地零改动、存储故障恢复后重试成功、
+  跨环境事件 ID 撞车不误判、缺配置与内部错误各自归类
 - `ArchiveScaleTest`：5000 条链上导出/核验耗时与内存（流式，核验侧 O(1) 内存）
 
 ### 7.2 手工端到端
@@ -246,6 +275,17 @@ curl -s -X POST "localhost:8080/audit/archive/export?fromSeq=1&toSeq=1"
 #   -> archiveFile 给出包路径（audit-data/archives/ 下）
 curl -s -X POST "localhost:8080/audit/archive/verify?path=<包路径>"
 #   -> valid=true；手工改包内任一字段后再次核验，可见对应类别的失败结论
+
+# 导入手工验证（本环境自己的包导回本环境：记录仍在链上 -> DUPLICATE_IGNORED）：
 curl -s -X POST "localhost:8080/audit/archive/import?path=<包路径>"
-#   -> 首次 IMPORTED，再次执行 DUPLICATE_IGNORED（幂等）
+
+# 跨环境导入手工验证：另起一套环境（独立数据目录与环境标识），把来源环境密钥配进信任列表
+AUDIT_DATA_DIR=/tmp/auditB AUDIT_ENV_ID=envB AUDIT_ARCHIVE_KEY=keyB \
+  mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081 --audit.trusted-archive-keys.local=<来源环境密钥>"
+curl -s -X POST "localhost:8081/audit/archive/import?path=<包路径>"
+#   -> 首次 IMPORTED（mergedCount 条并入本地链），再次执行 DUPLICATE_IGNORED（幂等）
+curl -s localhost:8081/audit/events
+#   -> 能查到并入的记录（事件 ID 形如 local:e1，即 来源环境:原eventId）
+curl -s localhost:8081/audit/verify
+#   -> valid=true，并入后整体校验通过，可继续 POST /audit/events 往后写
 ```

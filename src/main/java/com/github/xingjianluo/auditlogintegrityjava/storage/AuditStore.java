@@ -22,4 +22,11 @@ public interface AuditStore {
      * 返回保留下来的事件（非空时第一条即新链头）。
      */
     List<AuditEvent> pruneBefore(long keepBeforeSeq);
+
+    /**
+     * 整体重写链文件（临时文件 + 原子移动）：要么整体生效，要么原文件一字节不变。
+     * 不触碰锚点——调用方负责随后刷新锚点；两步骤之间崩溃留下的
+     * “锚点落后于链尾”形态由校验侧自动对账。
+     */
+    void rewriteAll(List<AuditEvent> events);
 }

@@ -29,5 +29,9 @@ public enum ArchiveFailureReason {
     /** 清单哈希与包内容不符（内容被改但未重签） */
     MANIFEST_MISMATCH,
     /** 签名不符：伪造、掉包或非本信任域密钥签发 */
-    SIGNATURE_MISMATCH
+    SIGNATURE_MISMATCH,
+    /** 包文件不存在或无法读取（接收侧问题，与包内容无关） */
+    PACKAGE_UNREADABLE,
+    /** 核验过程出现未预料的内部错误 */
+    INTERNAL_ERROR
 }
