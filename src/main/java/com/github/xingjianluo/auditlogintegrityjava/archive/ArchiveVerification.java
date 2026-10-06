@@ -47,19 +47,20 @@ public record ArchiveVerification(
 
     private static int priority(ArchiveFailureReason r) {
         return switch (r) {
-            case MALFORMED_PACKAGE -> 0;
-            case UNSUPPORTED_FORMAT -> 1;
-            case UNTRUSTED_ENVIRONMENT -> 2;
-            case ENVIRONMENT_MISMATCH -> 3;
-            case EMPTY_ARCHIVE -> 4;
-            case ORDER_VIOLATION -> 5;
-            case SEQUENCE_GAP -> 6;
-            case TRUNCATED -> 7;
-            case ENTRY_HASH_MISMATCH -> 8;
-            case LINK_MISMATCH -> 9;
-            case MANIFEST_MISMATCH -> 10;
-            case SIGNATURE_MISMATCH -> 11;
-            case OK -> 12;
+            case PACKAGE_NOT_FOUND -> 0;
+            case MALFORMED_PACKAGE -> 1;
+            case UNSUPPORTED_FORMAT -> 2;
+            case UNTRUSTED_ENVIRONMENT -> 3;
+            case ENVIRONMENT_MISMATCH -> 4;
+            case EMPTY_ARCHIVE -> 5;
+            case ORDER_VIOLATION -> 6;
+            case SEQUENCE_GAP -> 7;
+            case TRUNCATED -> 8;
+            case ENTRY_HASH_MISMATCH -> 9;
+            case LINK_MISMATCH -> 10;
+            case MANIFEST_MISMATCH -> 11;
+            case SIGNATURE_MISMATCH -> 12;
+            case OK -> 13;
         };
     }
 }

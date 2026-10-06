@@ -26,6 +26,23 @@ public class ArchiveKeyProvider {
     }
 
     /**
+     * 本地签发归档包所缺的配置项列表（为空表示配置齐全）。
+     * 用于把“没配置好”归类为可操作的结论，而不是导出中途抛异常。
+     */
+    public java.util.List<String> missingLocalConfig() {
+        java.util.List<String> missing = new java.util.ArrayList<>();
+        String envId = properties.getEnvironmentId();
+        if (envId == null || envId.isBlank()) {
+            missing.add("audit.environment-id");
+        }
+        String key = properties.getArchiveKey();
+        if (key == null || key.isBlank()) {
+            missing.add("audit.archive-key");
+        }
+        return missing;
+    }
+
+    /**
      * 本环境签名密钥（导出用）。未配置时抛异常，拒绝用默认弱密钥签发。
      */
     public String localKey() {

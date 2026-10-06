@@ -35,10 +35,15 @@ public class FileAuditStore implements AuditStore {
     private record CompactIntent(long keepBeforeSeq) {
     }
 
+    /** 合并导入的崩溃恢复意图：记录合并完成后链应有的条目数与尾部哈希。 */
+    private record MergeIntent(int expectedCount, String expectedTailHash) {
+    }
+
     private final Path dir;
     private final Path eventsFile;
     private final Path anchorFile;
     private final Path intentFile;
+    private final Path mergeIntentFile;
     private final ObjectMapper mapper;
 
     public FileAuditStore(AuditProperties properties, ObjectMapper objectMapper) {
@@ -46,11 +51,13 @@ public class FileAuditStore implements AuditStore {
         this.eventsFile = dir.resolve("events.jsonl");
         this.anchorFile = dir.resolve("anchor.json");
         this.intentFile = dir.resolve("compact.intent");
+        this.mergeIntentFile = dir.resolve("merge.intent");
         this.mapper = objectMapper;
         try {
             Files.createDirectories(dir);
             truncatePartialLastLine();
             recoverCompaction();
+            recoverMerge();
         } catch (IOException e) {
             throw new AuditStoreException("初始化审计存储失败: " + dir, e);
         }
@@ -145,6 +152,47 @@ public class FileAuditStore implements AuditStore {
 
     // ---- 崩溃恢复 ----
 
+    /**
+     * 原子合并一批事件到链尾并刷新锚点。
+     * 崩溃窗口与恢复：
+     * <ol>
+     *   <li>意图写入后、链文件替换前崩溃：旧链分毫不动，重启删除临时文件与意图；</li>
+     *   <li>链文件已替换、锚点未刷新崩溃：重启按链内容重算锚点，把合并推进完成。</li>
+     * </ol>
+     * 本次调用内若 IO 失败且尚未替换链文件，则立即清理意图与临时文件，
+     * 保证“失败即本地零改动”，调用方可安全重试。
+     */
+    @Override
+    public synchronized void mergeAppend(List<AuditEvent> batch, Anchor anchor) {
+        if (batch == null || batch.isEmpty()) {
+            return;
+        }
+        List<AuditEvent> current = readAll();
+        List<AuditEvent> merged = new ArrayList<>(current.size() + batch.size());
+        merged.addAll(current);
+        merged.addAll(batch);
+        AuditEvent newTail = merged.get(merged.size() - 1);
+        Path tmp = dir.resolve("events.jsonl.merge.tmp");
+        boolean moved = false;
+        try {
+            atomicWriteJson(mergeIntentFile, new MergeIntent(merged.size(), newTail.hash()));
+            writeEvents(tmp, merged);
+            moveAtomically(tmp, eventsFile);
+            moved = true;
+            atomicWriteJson(anchorFile, anchor);
+            Files.deleteIfExists(mergeIntentFile);
+        } catch (IOException e) {
+            if (!moved) {
+                // 链文件尚未被替换：清理本次痕迹，旧链保持原样
+                deleteIfRegularFile(tmp);
+                deleteIfRegularFile(dir.resolve("merge.intent.tmp"));
+                deleteIfRegularFile(mergeIntentFile);
+            }
+            // 已替换链文件但锚点写失败：保留 merge.intent，重启恢复会把合并推进完成
+            throw new AuditStoreException("合并导入事件失败（本地原有记录未受影响）", e);
+        }
+    }
+
     private void truncatePartialLastLine() throws IOException {
         if (!Files.exists(eventsFile) || Files.size(eventsFile) == 0) {
             return;
@@ -168,6 +216,41 @@ public class FileAuditStore implements AuditStore {
             return;
         }
         finishCompaction();
+    }
+
+    /**
+     * 合并导入的崩溃恢复（幂等）：
+     * 链已是合并后形态（条目数与尾哈希都吻合意图）则按链重算锚点推进完成；
+     * 否则说明崩溃发生在链文件替换之前，旧链完好，丢弃临时文件与意图即可。
+     */
+    private void recoverMerge() throws IOException {
+        if (!Files.exists(mergeIntentFile)) {
+            return;
+        }
+        MergeIntent intent = mapper.readValue(Files.readAllBytes(mergeIntentFile), MergeIntent.class);
+        List<AuditEvent> all = Files.exists(eventsFile) ? readAll() : List.of();
+        boolean rolledForward = all.size() == intent.expectedCount()
+                && !all.isEmpty()
+                && all.get(all.size() - 1).hash().equals(intent.expectedTailHash());
+        if (rolledForward) {
+            AuditEvent head = all.get(0);
+            AuditEvent tail = all.get(all.size() - 1);
+            atomicWriteJson(anchorFile,
+                    new Anchor(head.seq(), head.hash(), tail.seq(), tail.hash(), all.size()));
+        } else {
+            deleteIfRegularFile(dir.resolve("events.jsonl.merge.tmp"));
+        }
+        Files.deleteIfExists(mergeIntentFile);
+    }
+
+    private static void deleteIfRegularFile(Path p) {
+        try {
+            if (Files.isRegularFile(p)) {
+                Files.deleteIfExists(p);
+            }
+        } catch (IOException ignored) {
+            // 清理临时文件失败不影响结论
+        }
     }
 
     /**

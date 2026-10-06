@@ -7,6 +7,8 @@ import com.github.xingjianluo.auditlogintegrityjava.chain.AuditEvent;
 import com.github.xingjianluo.auditlogintegrityjava.chain.VerificationReport;
 import com.github.xingjianluo.auditlogintegrityjava.config.AuditProperties;
 import com.github.xingjianluo.auditlogintegrityjava.service.AuditService;
+import com.github.xingjianluo.auditlogintegrityjava.service.IntegrityException;
+import com.github.xingjianluo.auditlogintegrityjava.storage.AuditStoreException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -57,11 +59,31 @@ public class ArchiveService {
     /**
      * 导出 [fromSeq, toSeq] 区间为自包含归档包。
      * 下界严格（起点已被清理则拒绝），上界裁剪到当前链尾。
+     * 配置缺失与未预料内部错误都归类为可区分结论，不抛笼统异常。
      */
     public ArchiveExportResult exportRange(long fromSeq, long toSeq) {
         if (fromSeq <= 0 || toSeq < fromSeq) {
             throw new IllegalArgumentException("要求 1 <= fromSeq <= toSeq");
         }
+        List<String> missingConfig = keys.missingLocalConfig();
+        if (!missingConfig.isEmpty()) {
+            log.warn("归档导出中止: 配置缺失 {}", missingConfig);
+            return new ArchiveExportResult(ArchiveExportOutcome.CONFIG_MISSING,
+                    fromSeq, toSeq, 0, null,
+                    "归档所需配置缺失: " + String.join(", ", missingConfig) + "，请补齐后重试");
+        }
+        try {
+            return doExport(fromSeq, toSeq);
+        } catch (RuntimeException e) {
+            log.error("归档导出: 未预料的内部错误", e);
+            return new ArchiveExportResult(ArchiveExportOutcome.INTERNAL_ERROR,
+                    fromSeq, toSeq, 0, null,
+                    "导出过程出现未预料的内部错误（本地记录未受影响），可重试；反复出现请排查环境: "
+                            + e.getMessage());
+        }
+    }
+
+    private ArchiveExportResult doExport(long fromSeq, long toSeq) {
         VerificationReport report = auditService.verify();
         if (!report.valid()) {
             log.warn("归档导出中止: 本地完整性校验失败, 问题={}", report.issues());
@@ -164,62 +186,151 @@ public class ArchiveService {
     }
 
     /**
-     * 导入归档包到本环境（与本地链并存，不改写本地链）。
+     * 导入归档包到本环境：包内记录并入本地链，成为本环境自己的记录。
      *
      * <p>规则：
      * <ul>
      *   <li>先离线核验，包本身有问题 → INTEGRITY_REJECTED / UNTRUSTED_SOURCE，本地零改动；</li>
-     *   <li>幂等：同一环境同一区间的包已导入过 → DUPLICATE_IGNORED，不产生新记录；</li>
-     *   <li>原子：整体复制 + 原子移动，中途失败 → STORAGE_FAILED，本地已有记录零影响，可重试。</li>
+     *   <li>并入：事件内容原样保留，seq/链节/哈希按本地链尾重排，导入后即可与本地记录
+     *       一起查询、整体校验，并继续往后追加；</li>
+     *   <li>幂等：同一包（或区间重叠的包）重复/并发导入，已存在的记录按 eventId+内容
+     *       幂等跳过 → DUPLICATE_IGNORED，不堆重复记录、不动链；</li>
+     *   <li>清理后再导入：该包此前导入过但记录已被保留期清理 → 重新并入并明确给出
+     *       REIMPORTED_AFTER_PRUNE，不悄悄判成普通成功；</li>
+     *   <li>原子：合并是单步可恢复操作，接收/存储失败 → STORAGE_FAILED，
+     *       本地原有记录零改动，可重试；本地链本身破损 → LOCAL_CHAIN_INVALID；</li>
+     *   <li>包副本留存 imports/ 下作为证据，可随时独立离线核验。</li>
      * </ul>
      */
     public ArchiveImportResult importArchive(Path archiveFile) {
-        ArchiveVerification verification = verifier.verify(archiveFile, null);
+        ArchiveVerification verification;
+        try {
+            verification = verifier.verify(archiveFile, null);
+        } catch (RuntimeException e) {
+            log.error("归档导入: 核验过程出现未预料的内部错误", e);
+            return new ArchiveImportResult(ArchiveImportOutcome.INTERNAL_ERROR, null, null, 0,
+                    "核验过程出现未预料的内部错误（本地记录零改动），可重试；反复出现请排查环境: "
+                            + e.getMessage());
+        }
         if (!verification.valid()) {
-            ArchiveImportOutcome outcome =
-                    verification.primaryReason() == ArchiveFailureReason.UNTRUSTED_ENVIRONMENT
-                            ? ArchiveImportOutcome.UNTRUSTED_SOURCE
-                            : ArchiveImportOutcome.INTEGRITY_REJECTED;
+            boolean untrusted =
+                    verification.primaryReason() == ArchiveFailureReason.UNTRUSTED_ENVIRONMENT;
+            ArchiveImportOutcome outcome = untrusted
+                    ? ArchiveImportOutcome.UNTRUSTED_SOURCE
+                    : ArchiveImportOutcome.INTEGRITY_REJECTED;
+            String detail = untrusted
+                    ? "没有来源环境 " + verification.environmentId() + " 的核验密钥，无法确认包来源；"
+                            + "请把对方密钥配置到 audit.trusted-archive-keys." + verification.environmentId()
+                            + " 或与对方确认来源，本地记录零改动"
+                    : "归档包核验未通过（" + verification.primaryReason() + "），本地记录零改动；"
+                            + "应与提供方核对而非简单重试";
             log.warn("归档导入拒绝: outcome={}, 主因={}, 问题数={}",
                     outcome, verification.primaryReason(), verification.issues().size());
-            return new ArchiveImportResult(outcome, verification, null,
-                    "归档包核验未通过（" + verification.primaryReason() + "），本地记录零改动；"
-                            + "应与提供方核对而非简单重试");
+            return new ArchiveImportResult(outcome, verification, null, 0, detail);
+        }
+
+        List<AuditEvent> events;
+        try {
+            events = readArchiveEvents(archiveFile);
+        } catch (Exception e) {
+            // 核验已通过却读不出事件：未预料的内部状态，归类为内部错误而非包问题
+            log.error("归档导入: 读取已核验包失败", e);
+            return new ArchiveImportResult(ArchiveImportOutcome.INTERNAL_ERROR, verification,
+                    null, 0, "包核验通过但读取事件失败（本地记录零改动），可重试: " + e.getMessage());
         }
 
         String fileName = "imported-" + verification.environmentId()
                 + "-" + verification.fromSeq() + "-" + verification.toSeq() + ".json";
-        Path target = importDir.resolve(fileName);
+        boolean previouslyImported = Files.exists(importDir.resolve(fileName));
+
+        AuditService.MergeResult merge;
+        try {
+            // 跨环境导入：eventId 加 "来源环境/" 前缀做命名空间隔离；
+            // 同环境回导（如清理后恢复）保持原 eventId
+            String prefix = verification.environmentId().equals(keys.localEnvironmentId())
+                    ? "" : verification.environmentId() + "/";
+            merge = auditService.mergeImported(events, prefix);
+        } catch (IntegrityException e) {
+            log.warn("归档导入拒绝: 本地链完整性校验未通过, 问题={}", e.getReport().issues());
+            return new ArchiveImportResult(ArchiveImportOutcome.LOCAL_CHAIN_INVALID,
+                    verification, null, 0,
+                    "包本身有效，但本地链完整性校验未通过，拒绝在破损链上合并（本地记录零改动）；"
+                            + "请先处理本地链问题再导入");
+        } catch (AuditStoreException e) {
+            log.error("归档导入: 本地接收/存储失败, 原因={}", e.toString());
+            return new ArchiveImportResult(ArchiveImportOutcome.STORAGE_FAILED,
+                    verification, null, 0,
+                    "包本身有效，但本地接收/存储失败（本地记录零改动），可重试: " + e.getMessage());
+        } catch (RuntimeException e) {
+            log.error("归档导入: 未预料的内部错误", e);
+            return new ArchiveImportResult(ArchiveImportOutcome.INTERNAL_ERROR, verification,
+                    null, 0, "导入过程出现未预料的内部错误（本地记录零改动），可重试；反复出现请排查环境: "
+                            + e.getMessage());
+        }
+
+        if (merge.appended() == 0) {
+            log.info("归档导入幂等忽略: 包内 {} 条记录均已在本地链中", merge.skipped());
+            return new ArchiveImportResult(ArchiveImportOutcome.DUPLICATE_IGNORED,
+                    verification, previouslyImported ? fileName : null, 0,
+                    "包内记录已全部存在于本地链，幂等忽略，未新增记录");
+        }
+
+        // 留存包副本作为证据（可独立离线核验）；副本写失败不影响已完成的合并，但要写日志说明
+        String storedAs = null;
+        String copyNote = "";
         try {
             Files.createDirectories(importDir);
-            if (Files.exists(target)) {
-                log.info("归档导入幂等忽略: 已存在 {}", target);
-                return new ArchiveImportResult(ArchiveImportOutcome.DUPLICATE_IGNORED,
-                        verification, fileName, "同一归档段已导入过，幂等忽略，未新增记录");
-            }
             Path tmp = importDir.resolve(fileName + ".tmp");
             try {
-                Files.copy(archiveFile, tmp);
-                moveAtomically(tmp, target);
+                Files.copy(archiveFile, tmp,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                moveAtomically(tmp, importDir.resolve(fileName));
             } catch (IOException e) {
                 deleteQuietly(tmp);
                 throw e;
             }
+            storedAs = fileName;
         } catch (IOException e) {
-            log.error("归档导入: 本地接收/存储失败, 原因={}", e.toString());
-            return new ArchiveImportResult(ArchiveImportOutcome.STORAGE_FAILED,
-                    verification, null, "包本身有效，但本地存储失败（本地记录零改动），可重试: "
-                    + e.getMessage());
+            copyNote = "；注意：包副本留存失败（" + e.getMessage() + "），记录已正常并入本地链";
+            log.warn("归档导入: 包副本留存失败, 原因={}", e.toString());
         }
-        log.info("归档导入完成: storedAs={}, env={}, range=[{},{}], count={}",
-                fileName, verification.environmentId(), verification.fromSeq(),
-                verification.toSeq(), verification.scannedEntries());
-        return new ArchiveImportResult(ArchiveImportOutcome.IMPORTED, verification, fileName,
-                "归档段已导入并与本地记录并存: " + fileName);
+
+        ArchiveImportOutcome outcome = previouslyImported
+                ? ArchiveImportOutcome.REIMPORTED_AFTER_PRUNE
+                : ArchiveImportOutcome.IMPORTED;
+        String detail = previouslyImported
+                ? "该包此前导入过、记录已被保留期清理，本次已重新并入本地链 " + merge.appended() + " 条"
+                        + "（幂等跳过 " + merge.skipped() + " 条）" + copyNote
+                : "已把 " + merge.appended() + " 条记录并入本地链（幂等跳过 " + merge.skipped()
+                        + " 条），可与本地记录一起查询、整体校验并继续追加" + copyNote;
+        log.info("归档导入完成: outcome={}, env={}, 区间=[{},{}], 新并入={}, 跳过={}, 副本={}",
+                outcome, verification.environmentId(), verification.fromSeq(),
+                verification.toSeq(), merge.appended(), merge.skipped(), storedAs);
+        return new ArchiveImportResult(outcome, verification, storedAs, merge.appended(), detail);
     }
 
     /**
-     * 已导入的归档段文件名列表（与本地链并存，可逐个离线核验）。
+     * 流式读出包内全部事件（导入用）。调用前包须已通过离线核验。
+     */
+    private List<AuditEvent> readArchiveEvents(Path archiveFile) throws IOException {
+        List<AuditEvent> events = new ArrayList<>();
+        try (var in = Files.newInputStream(archiveFile);
+             var p = mapper.getFactory().createParser(in)) {
+            while (p.nextToken() != null) {
+                if ("events".equals(p.currentName())) {
+                    p.nextToken(); // START_ARRAY
+                    while (p.nextToken() == com.fasterxml.jackson.core.JsonToken.START_OBJECT) {
+                        events.add(mapper.readValue(p, AuditEvent.class));
+                    }
+                    break;
+                }
+            }
+        }
+        return events;
+    }
+
+    /**
+     * 已留存的归档包副本文件名列表（imports/ 下，作为导入证据，可逐个独立离线核验）。
      */
     public List<String> listImports() {
         if (!Files.isDirectory(importDir)) {

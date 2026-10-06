@@ -13,5 +13,9 @@ public enum ArchiveExportOutcome {
     /** 本地链完整性校验未通过，拒绝导出 */
     INTEGRITY_FAILED,
     /** 写归档文件失败（本地存储问题，可重试） */
-    STORAGE_FAILED
+    STORAGE_FAILED,
+    /** 归档所需配置缺失（如 audit.environment-id / audit.archive-key），补齐后重试 */
+    CONFIG_MISSING,
+    /** 未预料的内部错误（与上述各类区分开；可重试，反复出现应排查环境） */
+    INTERNAL_ERROR
 }

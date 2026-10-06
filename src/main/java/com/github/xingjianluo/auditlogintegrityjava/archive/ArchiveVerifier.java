@@ -55,6 +55,14 @@ public class ArchiveVerifier {
      */
     public ArchiveVerification verify(Path archiveFile, String expectedEnvironmentId) {
         State s = new State();
+        if (archiveFile == null || !Files.isRegularFile(archiveFile)) {
+            // 包根本没送达/路径错误：单独归类，不再叠加格式/元数据等衍生判定
+            ArchiveVerification result = ArchiveVerification.invalid(null, 0, 0, 0,
+                    List.of(new ArchiveIssue(ArchiveFailureReason.PACKAGE_NOT_FOUND, null, null,
+                            "包文件不存在或不是可读文件: " + archiveFile)));
+            log.info("归档包离线核验: 结论=无效, 主因=PACKAGE_NOT_FOUND, file={}", archiveFile);
+            return result;
+        }
         try (InputStream in = Files.newInputStream(archiveFile);
              JsonParser p = mapper.getFactory().createParser(in)) {
             if (p.nextToken() != JsonToken.START_OBJECT) {

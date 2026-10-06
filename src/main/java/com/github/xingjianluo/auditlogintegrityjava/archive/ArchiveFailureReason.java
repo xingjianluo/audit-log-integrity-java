@@ -6,6 +6,8 @@ package com.github.xingjianluo.auditlogintegrityjava.archive;
 public enum ArchiveFailureReason {
     /** 核验通过 */
     OK,
+    /** 包文件不存在或不可读（路径错误或包未送达） */
+    PACKAGE_NOT_FOUND,
     /** 包文件无法解析（非截断导致的结构损坏） */
     MALFORMED_PACKAGE,
     /** 包被截断：物理上提前结束，或事件数/尾部序号少于清单声明 */

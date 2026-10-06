@@ -115,4 +115,61 @@ class StorageFailureAndRecoveryTest {
         assertEquals(List.of("p3", "p4"), events.stream().map(AuditEvent::eventId).toList());
         assertTrue(report.valid());
     }
+
+    @Test
+    void mergeCrashAfterChainRewriteIsCompletedOnRestart() throws Exception {
+        var h = AuditTestSupport.harness(dir);
+        h.events().appendWithId("m1", "a", "A", "r", AuditTestSupport.payload());
+        h.events().appendWithId("m2", "b", "B", "r", AuditTestSupport.payload());
+
+        // 模拟合并导入崩溃在“链文件已替换、锚点未刷新”之间：
+        // 手工把第 3 条（合法链接）写进链文件，留下 merge.intent，锚点停在 count=2
+        AuditEvent tail = h.auditService().readAll().get(1);
+        AuditEvent third = new AuditEvent("m3", 3, System.currentTimeMillis(),
+                "c", "C", "r", AuditTestSupport.payload(), 1, tail.hash(), "");
+        third = new AuditEvent(third.eventId(), third.seq(), third.timestamp(), third.actor(),
+                third.action(), third.resource(), third.payload(), third.policyVersion(),
+                third.prevHash(), h.hasher().computeHash(third));
+        h.store().append(third);
+        Files.writeString(dir.resolve("merge.intent"),
+                "{\"expectedCount\":3,\"expectedTailHash\":\"" + third.hash() + "\"}");
+        log.info("[输入] 链文件已含合并后的 3 条、merge.intent 残留、锚点停在 count=2（崩溃窗口）");
+
+        var reopened = AuditTestSupport.harness(dir);
+        VerificationReport report = reopened.auditService().verify();
+        log.info("[判定依据] 重启后校验={}, 条数={}, tailSeq={}, intent残留={}",
+                report.valid(), report.scannedEntries(), report.tailSeq(),
+                Files.exists(dir.resolve("merge.intent")));
+        assertTrue(report.valid(), "恢复应把合并推进完成：锚点按链重算");
+        assertEquals(3, report.scannedEntries());
+        assertTrue(Files.notExists(dir.resolve("merge.intent")), "恢复后意图文件应被清理");
+    }
+
+    @Test
+    void mergeCrashBeforeChainRewriteLeavesOldChainUntouched() throws Exception {
+        var h = AuditTestSupport.harness(dir);
+        h.events().appendWithId("m1", "a", "A", "r", AuditTestSupport.payload());
+        h.events().appendWithId("m2", "b", "B", "r", AuditTestSupport.payload());
+        byte[] chainBefore = Files.readAllBytes(dir.resolve("events.jsonl"));
+
+        // 模拟合并导入崩溃在“链文件替换之前”：只留下意图与临时文件
+        Files.writeString(dir.resolve("merge.intent"),
+                "{\"expectedCount\":5,\"expectedTailHash\":\"deadbeef\"}");
+        Files.writeString(dir.resolve("events.jsonl.merge.tmp"), "{\"partialMergedLine\":");
+        log.info("[输入] merge.intent 与半截临时文件残留、链文件未动（崩溃窗口）");
+
+        var reopened = AuditTestSupport.harness(dir);
+        VerificationReport report = reopened.auditService().verify();
+        byte[] chainAfter = Files.readAllBytes(dir.resolve("events.jsonl"));
+        log.info("[判定依据] 重启后校验={}, 条数={}, 链字节不变={}, 临时文件残留={}",
+                report.valid(), report.scannedEntries(),
+                java.util.Arrays.equals(chainBefore, chainAfter),
+                Files.exists(dir.resolve("events.jsonl.merge.tmp"))
+                        || Files.exists(dir.resolve("merge.intent")));
+        assertTrue(report.valid());
+        assertEquals(2, report.scannedEntries());
+        assertTrue(java.util.Arrays.equals(chainBefore, chainAfter), "旧链必须分毫不动");
+        assertTrue(Files.notExists(dir.resolve("events.jsonl.merge.tmp")));
+        assertTrue(Files.notExists(dir.resolve("merge.intent")));
+    }
 }

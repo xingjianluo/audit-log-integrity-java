@@ -148,6 +148,111 @@ public class AuditService {
         }
     }
 
+    /**
+     * 合并导入结果。
+     *
+     * @param appended 本次新并入链尾的记录数
+     * @param skipped  因本地已存在（同 eventId 且内容一致）而幂等跳过的记录数
+     */
+    public record MergeResult(int appended, int skipped) {
+    }
+
+    /**
+     * 把一批来自归档包的事件并入本地链（幂等、原子）。
+     *
+     * <p>规则：
+     * <ul>
+     *   <li>事件内容（eventId/timestamp/actor/action/resource/payload/policyVersion）原样保留，
+     *       seq/prevHash/hash 按本地链尾重新编号与链接——并入后即为本地链的一部分，
+     *       可正常查询、整体校验、并继续往后追加；</li>
+     *   <li>eventIdPrefix 非空时（跨环境导入），落盘的 eventId 统一加上该前缀做命名空间
+     *       隔离，避免来源环境与本地环境的 eventId 撞车导致后续追加被误判为冲突；
+     *       前缀是确定性的，同一包重复导入仍按同一 eventId 幂等；</li>
+     *   <li>eventId 与内容均与本地已有记录一致的视为重复，幂等跳过（跨包区间重叠、
+     *       同一包重复导入、并发导入都不会堆重复记录）；</li>
+     *   <li>本地链当前不完整：抛 {@link IntegrityException}，拒绝在破损链上合并；</li>
+     *   <li>持久化是单步可恢复操作：存储失败时本地原有记录零改动。</li>
+     * </ul>
+     */
+    public MergeResult mergeImported(List<AuditEvent> sourceEvents, String eventIdPrefix) {
+        if (sourceEvents == null || sourceEvents.isEmpty()) {
+            return new MergeResult(0, 0);
+        }
+        String prefix = eventIdPrefix == null ? "" : eventIdPrefix;
+        synchronized (writeLock) {
+            CheckedChain chain = loadAndCheck();
+            if (!chain.report.valid()) {
+                throw new IntegrityException("完整性校验未通过，拒绝合并导入事件", chain.report);
+            }
+            List<AuditEvent> events = chain.events;
+
+            // 内容键索引：同 eventId（含前缀）且内容一致才算重复；
+            // 仅 eventId 撞车但内容不同的，仍是不同事件，照常并入
+            java.util.Set<List<Object>> seen = new java.util.HashSet<>();
+            for (AuditEvent e : events) {
+                seen.add(contentKey(e));
+            }
+            List<AuditEvent> fresh = new ArrayList<>();
+            int skipped = 0;
+            for (AuditEvent src : sourceEvents) {
+                AuditEvent effective = prefix.isEmpty() ? src
+                        : new AuditEvent(prefix + src.eventId(), src.seq(), src.timestamp(),
+                                src.actor(), src.action(), src.resource(),
+                                src.payload(), src.policyVersion(), src.prevHash(), src.hash());
+                if (seen.add(contentKey(effective))) {
+                    fresh.add(effective);
+                } else {
+                    skipped++;
+                }
+            }
+            if (fresh.isEmpty()) {
+                log.info("合并导入: 全部 {} 条均已存在，幂等忽略", skipped);
+                return new MergeResult(0, skipped);
+            }
+
+            long seq = events.isEmpty() ? 1L : events.get(events.size() - 1).seq() + 1;
+            String prevHash = events.isEmpty() ? ChainHasher.GENESIS_HASH
+                    : events.get(events.size() - 1).hash();
+            List<AuditEvent> rechained = new ArrayList<>(fresh.size());
+            for (AuditEvent src : fresh) {
+                AuditEvent candidate = new AuditEvent(src.eventId(), seq, src.timestamp(),
+                        src.actor(), src.action(), src.resource(),
+                        src.payload(), src.policyVersion(), prevHash, "");
+                String hash = hasher.computeHash(candidate);
+                rechained.add(new AuditEvent(candidate.eventId(), candidate.seq(), candidate.timestamp(),
+                        candidate.actor(), candidate.action(), candidate.resource(),
+                        candidate.payload(), candidate.policyVersion(), candidate.prevHash(), hash));
+                prevHash = hash;
+                seq++;
+            }
+
+            AuditEvent newTail = rechained.get(rechained.size() - 1);
+            Anchor newAnchor;
+            if (events.isEmpty()) {
+                AuditEvent head = rechained.get(0);
+                newAnchor = new Anchor(head.seq(), head.hash(), newTail.seq(), newTail.hash(),
+                        rechained.size());
+            } else {
+                AuditEvent head = events.get(0);
+                newAnchor = new Anchor(head.seq(), head.hash(), newTail.seq(), newTail.hash(),
+                        events.size() + rechained.size());
+            }
+            store.mergeAppend(rechained, newAnchor);
+            log.info("合并导入完成: 新并入 {} 条(seq {}..{}), 幂等跳过 {} 条, 链尾 hash={}",
+                    rechained.size(), newTail.seq() - rechained.size() + 1, newTail.seq(),
+                    skipped, abbreviate(newTail.hash()));
+            return new MergeResult(rechained.size(), skipped);
+        }
+    }
+
+    private static List<Object> contentKey(AuditEvent e) {
+        // payload 按键字典序固定表示，避免 Map 迭代顺序差异造成误判
+        String payload = e.payload() == null ? "" : new java.util.TreeMap<>(e.payload()).toString();
+        return List.of(e.eventId(), e.timestamp(), String.valueOf(e.actor()),
+                String.valueOf(e.action()), String.valueOf(e.resource()),
+                payload, e.policyVersion());
+    }
+
     // ---- 内部：链校验 + 锚点对账 ----
 
     private record CheckedChain(List<AuditEvent> events, Anchor anchor, VerificationReport report) {
